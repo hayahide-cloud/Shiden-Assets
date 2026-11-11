@@ -21,7 +21,7 @@
      dashboard.json に保存され、ダッシュボード（Shiden-Dashboard）が
      同じファイルを読み込んで表示する。
      トークンは各端末のブラウザ内(localStorage)のみに保存される。
-     接続情報は Shiden Password Manager（紫電パスワードマネージャー）から
+     接続情報は Shiden Vault（紫電パスワードマネージャー）から
      自動取り込みもできる（末尾の adoptHubConnection 参照）。
      ================================================================ */
   :root {
@@ -856,7 +856,7 @@ document.getElementById("cfg-clear").addEventListener("click", () => { localStor
 document.getElementById("gh-sync").addEventListener("click", sync);
 
 
-/* ---------- 紫電ハブ接続（Shiden Password Manager からの自動接続） ----------
+/* ---------- 紫電ハブ接続（Shiden Vault からの自動接続） ----------
    パスワードマネージャーが同一オリジン（hayahide-cloud.github.io）の localStorage
    "shiden_hub_connection" に書いた接続情報、または URL の #shiden-connect=<base64url JSON>
    から owner / repo / branch / token を受け取る。
@@ -879,7 +879,7 @@ function adoptHubConnection() {
   return true;
 }
 
-if (adoptHubConnection()) status("Shiden Password Manager の接続情報を取り込みました");
+if (adoptHubConnection()) status("Shiden Vault の接続情報を取り込みました");
 render();
 if (cfgOk(getCfg())) { status("設定済み"); sync(); } else { status("未同期（この端末はまだ設定していません）"); }
 </script>
