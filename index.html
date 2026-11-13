@@ -158,7 +158,9 @@
       </span>
     </div>
     <div class="sync-cfg" id="gh-cfg-panel">
-      <label>GitHub Private リポジトリ（Hayahide-Log）の dashboard.json に資産データを保存します（各端末で1回設定）。Fine-grained トークンは対象リポジトリのみ・Contents読み書きで発行してください。ダッシュボード側は「資産リポ」欄を空にすると同じファイルを読み込みます。</label>
+      <label>2台目以降の端末やホーム画面アプリは、Shiden Vault で発行した接続コード（合言葉）を入れるだけで接続できます。</label>
+      <div style="display:flex; gap:8px; margin-bottom:14px"><input id="cfg-code" placeholder="接続コード（合言葉）" autocapitalize="characters" autocorrect="off" autocomplete="off" spellcheck="false" style="flex:1; min-width:0"><button class="btn" id="cfg-code-go" type="button" style="flex:none">接続</button></div>
+      <label>または手入力: GitHub Private リポジトリ（Hayahide-Log）の dashboard.json に資産データを保存します（各端末で1回設定）。Fine-grained トークンは対象リポジトリのみ・Contents読み書きで発行してください。ダッシュボード側は「資産リポ」欄を空にすると同じファイルを読み込みます。</label>
       <div class="cfg-grid">
         <input id="cfg-owner" placeholder="owner（例: hayahide-cloud）" autocapitalize="off" autocorrect="off">
         <input id="cfg-repo" placeholder="repo（例: Hayahide-Log）" value="Hayahide-Log" autocapitalize="off" autocorrect="off">
@@ -820,6 +822,7 @@ async function sync() {
   if (!cfgOk(c)) { status("未設定"); return; }
   if (syncing) return;
   syncing = true; status("同期中…");
+  let retry = false;
   try {
     // 競合(409)は他端末の更新が原因。最新shaを取り直して数回まで再試行する
     let done = false, lastErr;
@@ -829,7 +832,13 @@ async function sync() {
     }
     if (!done) throw lastErr;
     render(); status("同期完了 " + hhmm());
-  } catch (e) { status("同期失敗: " + e.message); } finally { syncing = false; }
+  } catch (e) {
+    // トークン失効（401/403）なら接続コードで新しいトークンを取り直して1回だけ再試行
+    if (/\b40[13]\b/.test(e.message) && !sync.recovering) { sync.recovering = true; retry = await recoverByCode(); }
+    if (!retry) status("同期失敗: " + e.message);
+  } finally { syncing = false; }
+  if (retry) { status("接続コードから新しいトークンを取得しました"); await sync(); }
+  sync.recovering = false;
 }
 function scheduleSync() { if (!cfgOk(getCfg())) return; clearTimeout(syncTimer); syncTimer = setTimeout(sync, 2500); }
 
@@ -854,7 +863,54 @@ document.getElementById("cfg-save").addEventListener("click", () => {
 });
 document.getElementById("cfg-clear").addEventListener("click", () => { localStorage.removeItem(CFG_KEY); fillCfg(); status("設定を削除しました"); });
 document.getElementById("gh-sync").addEventListener("click", sync);
+document.getElementById("cfg-code-go").addEventListener("click", async () => {
+  const code = document.getElementById("cfg-code").value;
+  if (!normCode(code)) return;
+  status("接続コードを確認中…");
+  try { await applyConnectCode(code); document.getElementById("cfg-code").value = ""; panel.classList.remove("open"); sync(); }
+  catch (e) { status(e.message); alert(e.message); }
+});
 
+
+/* ---------- 紫電 接続コード（Shiden Vault の合言葉で自動接続） ----------
+   Shiden Vault が接続情報（owner / repo / branch / token）を合言葉で暗号化
+   （PBKDF2 → AES-256-GCM）して公開ページ Shiden-Vault/connect.json に置く。
+   設定欄に合言葉を入れると取り込み、合言葉は同一オリジン共有キー
+   "shiden_connect_code" に保存する（同じブラウザの他の紫電アプリも自動で使える）。
+   同期が 401/403 で失敗したら合言葉で取り直し、Vault 側でトークンを
+   更新・再発行していれば自動で新しいトークンに切り替わる。 */
+const CONNECT_URL = "https://hayahide-cloud.github.io/Shiden-Vault/connect.json", CODE_KEY = "shiden_connect_code";
+const normCode = s => String(s || "").normalize("NFKC").replace(/[\s\-ー－_]/g, "").toUpperCase();
+async function fetchConnect(code) {
+  const r = await fetch(CONNECT_URL + "?t=" + Date.now(), { cache: "no-store" });
+  if (r.status === 404) throw new Error("接続コードがまだ発行されていません");
+  if (!r.ok) throw new Error("接続コードの取得に失敗しました（" + r.status + "）");
+  const f = await r.json();
+  if (f.revoked) throw new Error("接続コードは無効化されています");
+  if (f.format !== "shiden-connect" || !f.kdf) throw new Error("接続ファイルの形式が不正です");
+  const u8 = b => Uint8Array.from(atob(b), ch => ch.charCodeAt(0));
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(normCode(code)), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: u8(f.kdf.salt), iterations: f.kdf.iter, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  let pt;
+  try { pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: u8(f.iv) }, key, u8(f.ct)); }
+  catch (e) { throw new Error("接続コード（合言葉）が違います"); }
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+// 合言葉で接続情報を取り込む。設定（トークン等）が変わったら true
+async function applyConnectCode(code) {
+  const hub = await fetchConnect(code);
+  if (!hub.token || !hub.owner || !hub.repo) throw new Error("接続情報が不完全です");
+  const c = getCfg(), changed = c.token !== hub.token || c.owner !== hub.owner || c.repo !== hub.repo || (c.branch || "main") !== (hub.branch || "main");
+  setCfg(Object.assign({}, c, { owner: hub.owner, repo: hub.repo, branch: hub.branch || "main", token: hub.token, path: c.path || "dashboard.json" }));
+  try { localStorage.setItem(CODE_KEY, normCode(code)); } catch (e) {}
+  return changed;
+}
+// 保存済みの合言葉で取り直す（失敗・変化なしは false）
+async function recoverByCode() {
+  let code = ""; try { code = localStorage.getItem(CODE_KEY) || ""; } catch (e) {}
+  if (!code) return false;
+  try { return await applyConnectCode(code); } catch (e) { return false; }
+}
 
 /* ---------- 紫電ハブ接続（Shiden Vault からの自動接続） ----------
    パスワードマネージャーが同一オリジン（hayahide-cloud.github.io）の localStorage
@@ -879,9 +935,12 @@ function adoptHubConnection() {
   return true;
 }
 
-if (adoptHubConnection()) status("Shiden Vault の接続情報を取り込みました");
-render();
-if (cfgOk(getCfg())) { status("設定済み"); sync(); } else { status("未同期（この端末はまだ設定していません）"); }
+(async () => {
+  if (adoptHubConnection()) status("Shiden Vault の接続情報を取り込みました");
+  else if (!cfgOk(getCfg()) && await recoverByCode()) status("接続コードで接続しました");
+  render();
+  if (cfgOk(getCfg())) { status("設定済み"); sync(); } else { status("未同期（この端末はまだ設定していません）"); }
+})();
 </script>
 </body>
 </html>
